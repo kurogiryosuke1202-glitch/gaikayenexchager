@@ -3,118 +3,90 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import date, timedelta
 import pandas as pd
+import re
 
 st.set_page_config(page_title="外貨→円 変換", page_icon="💱")
 st.title("💱 外貨 → 円 変換アプリ")
 st.caption("三菱UFJ銀行 公表対顧客外国為替相場 (MURC掲載) を使用")
 
 CURRENCIES = {
-    "USD": "米ドル",
-    "EUR": "ユーロ",
-    "GBP": "イギリスポンド",
-    "AUD": "オーストラリア・ドル",
-    "NZD": "ニュージーランド・ドル",
-    "CAD": "カナダドル",
-    "CHF": "スイスフラン",
-    "CNY": "中国元",
-    "HKD": "香港ドル",
-    "SGD": "シンガポール・ドル",
-    "KRW": "韓国ウォン (100単位)",
-    "THB": "タイ・バーツ",
+    "USD": "米ドル", "EUR": "ユーロ", "GBP": "イギリスポンド",
+    "AUD": "オーストラリア・ドル", "NZD": "ニュージーランド・ドル",
+    "CAD": "カナダドル", "CHF": "スイスフラン", "CNY": "中国元",
+    "HKD": "香港ドル", "SGD": "シンガポール・ドル",
+    "KRW": "韓国ウォン (100単位)", "THB": "タイ・バーツ",
     "ZAR": "南アフリカ・ランド",
-    "DKK": "デンマーク・クローネ",
-    "NOK": "ノルウェー・クローネ",
-    "SEK": "スウェーデン・クローナ",
 }
 PER_100 = ["KRW", "IDR"]
 
 
-def parse_number(text: str):
-    """文字列から数値を抽出。unquoted等はNone"""
+def parse_number(text):
     if not text:
         return None
-    t = str(text).strip().replace(",", "").replace("\xa0", "")
+    t = str(text).strip().replace(",", "").replace("\xa0", "").replace(" ", "")
     try:
         return float(t)
     except ValueError:
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_mufg(target_date: date):
-    """MUFGページからレート辞書を取得"""
-    id_str = target_date.strftime("%Y%m%d")
-    
-    # 過去ページ → 本日ページの順で試行
-    urls = [
-        f"https://www.murc-kawasesouba.jp/fx/past/index.php?id={id_str}",
-        f"https://www.murc-kawasesouba.jp/fx/lastmonth.php?id={id_str}",
-    ]
-    
-    html = None
-    used_url = None
-    for url in urls:
-        try:
-            res = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15,
-            )
-            res.encoding = res.apparent_encoding or "shift_jis"
-            if res.status_code == 200 and len(res.text) > 1000:
-                html = res.text
-                used_url = url
-                break
-        except Exception:
-            continue
-    
-    if not html:
-        raise RuntimeError("MUFGサイトに接続できませんでした")
-    
+def parse_html_for_rates(html: str):
+    """HTMLからTTS/TTB表を抽出"""
     soup = BeautifulSoup(html, "html.parser")
     
-    # 全テーブルを走査して、USD行を含むものを取得
-    rates = {}
+    # ページ日付検出
     page_date = None
-    
-    # 日付検出(ページ内テキストから)
-    text_all = soup.get_text()
-    import re
-    m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text_all)
+    m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", soup.get_text())
     if m:
         page_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     
-    for table in soup.find_all("table"):
+    rates = {}
+    tables_info = []  # デバッグ用
+    
+    for ti, table in enumerate(soup.find_all("table")):
         rows = table.find_all("tr")
-        if len(rows) < 3:
+        if len(rows) < 2:
             continue
         
-        # ヘッダー行を解析(TTS/TTBの列位置を取得)
-        header_cells = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
-        if not any("TTS" in h.upper() for h in header_cells):
+        # 全行スキャンしてヘッダー行を探す
+        header_idx = None
+        header_cells = None
+        for ri, tr in enumerate(rows):
+            cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+            if any("TTS" in c.upper() for c in cells) and any("TTB" in c.upper() for c in cells):
+                header_idx = ri
+                header_cells = cells
+                break
+        
+        if header_idx is None:
             continue
+        
+        tables_info.append({
+            "table_index": ti,
+            "header_row": header_idx,
+            "headers": header_cells,
+        })
         
         tts_idx = next((i for i, h in enumerate(header_cells) if "TTS" in h.upper()), None)
         ttb_idx = next((i for i, h in enumerate(header_cells) if "TTB" in h.upper()), None)
         code_idx = next((i for i, h in enumerate(header_cells) if "Code" in h or "略称" in h), None)
         
-        if tts_idx is None or ttb_idx is None:
-            continue
-        
-        # データ行を解析
-        for tr in rows[1:]:
+        # データ行解析
+        for tr in rows[header_idx + 1:]:
             cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
-            if len(cells) <= max(tts_idx, ttb_idx):
+            if len(cells) <= max(tts_idx or 0, ttb_idx or 0):
                 continue
             
-            # 通貨コード取得(code_idxが無ければ全セルから3文字大文字を探す)
+            # 通貨コード特定
             code = None
             if code_idx is not None and code_idx < len(cells):
-                code = cells[code_idx].strip()
-            if not code or len(code) != 3:
+                v = cells[code_idx].strip()
+                if len(v) == 3 and v.isalpha():
+                    code = v.upper()
+            if not code:
                 for c in cells:
                     cs = c.strip()
-                    if len(cs) == 3 and cs.isupper() and cs.isalpha():
+                    if len(cs) == 3 and cs.isalpha() and cs.isupper():
                         code = cs
                         break
             if not code:
@@ -129,12 +101,50 @@ def fetch_mufg(target_date: date):
             rates[code] = {"TTS": tts, "TTB": ttb, "TTM": ttm}
         
         if rates:
-            break  # 1つの表で見つかれば終了
+            break
     
-    if not rates:
-        raise ValueError(f"レート表が解析できません(取得URL: {used_url})")
+    return rates, page_date, tables_info
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_mufg(target_date: date):
+    """複数URLを試行してMUFGレート取得"""
+    id_str = target_date.strftime("%Y%m%d")
     
-    return rates, page_date, used_url
+    urls = [
+        f"https://www.murc-kawasesouba.jp/fx/past/index.php?id={id_str}",
+        f"https://www.murc-kawasesouba.jp/fx/historical/k_{id_str}.php",
+        f"https://www.murc-kawasesouba.jp/fx/past_3month_result.php?id={id_str}",
+        f"https://www.murc-kawasesouba.jp/fx/index.php",  # 本日ページ(最終フォールバック)
+    ]
+    
+    debug_log = []
+    
+    for url in urls:
+        try:
+            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            res.encoding = res.apparent_encoding or "shift_jis"
+            debug_log.append({
+                "url": url,
+                "status": res.status_code,
+                "size": len(res.text),
+            })
+            
+            if res.status_code != 200 or len(res.text) < 1000:
+                continue
+            
+            rates, page_date, tables_info = parse_html_for_rates(res.text)
+            debug_log[-1]["page_date"] = page_date
+            debug_log[-1]["tables_found"] = len(tables_info)
+            debug_log[-1]["currencies_found"] = len(rates)
+            
+            if rates:
+                return rates, page_date, url, debug_log, res.text
+        except Exception as e:
+            debug_log.append({"url": url, "error": str(e)})
+            continue
+    
+    return None, None, None, debug_log, None
 
 
 # --- UI ---
@@ -151,17 +161,24 @@ rate_key = rate_type.split("(")[0].strip()
 
 if st.button("🔄 レート取得して変換", type="primary"):
     with st.spinner("MUFGからレート取得中..."):
-        try:
-            rates, page_date, used_url = fetch_mufg(target_date)
-            
-            # ページ日付と指定日が違う場合の警告
+        rates, page_date, used_url, debug_log, raw_html = fetch_mufg(target_date)
+        
+        if not rates:
+            st.error("❌ どのURLからもレート取得できませんでした")
+            with st.expander("🔧 デバッグ情報(必読)"):
+                st.json(debug_log)
+                if raw_html:
+                    st.subheader("取得HTML(冒頭2000文字)")
+                    st.code(raw_html[:2000])
+        else:
             req_str = target_date.strftime("%Y-%m-%d")
             if page_date and page_date != req_str:
-                st.warning(f"⚠ 指定日 {req_str} のデータが無く、ページには {page_date} のレートが表示されています。"
-                           f"土日祝・休業日の可能性があります。")
+                st.warning(f"⚠ 指定日 {req_str} のデータが無く、ページ表示日は {page_date} です。"
+                           f"土日祝・休業日・未来日付の可能性があります。")
             
             if code not in rates:
-                st.error(f"❌ {code} のレートが見つかりません(unquotedの可能性)")
+                st.error(f"❌ {code} のレートが見つかりません")
+                st.write("検出された通貨:", list(rates.keys()))
             else:
                 r = rates[code][rate_key]
                 divisor = 100 if code in PER_100 else 1
@@ -173,20 +190,16 @@ if st.button("🔄 レート取得して変換", type="primary"):
                     value=f"{jpy:,.2f} 円"
                 )
                 st.code(f"{jpy}", language="text")
-                st.caption("↑ 右上のコピーアイコンでコピーできます")
+                st.caption("↑ 右上のコピーアイコンでコピー")
 
-                with st.expander("📊 当日の全レート(TTM=(TTS+TTB)/2)"):
+                with st.expander("📊 当日の全レート"):
                     df_show = pd.DataFrame(rates).T
-                    df_show.index.name = "通貨コード"
+                    df_show.index.name = "通貨"
                     st.dataframe(df_show, use_container_width=True)
-                
-                with st.expander("🔧 デバッグ情報"):
-                    st.write(f"取得URL: {used_url}")
-                    st.write(f"検出通貨数: {len(rates)}")
-        
-        except Exception as e:
-            st.error(f"❌ 取得エラー: {e}")
-            st.info("土日祝日・未来日付は取得できません。平日を選んでください。")
+            
+            with st.expander("🔧 デバッグ情報"):
+                st.write("使用URL:", used_url)
+                st.json(debug_log)
 
 # 手動レート
 with st.expander("🛠 手動レート入力"):
