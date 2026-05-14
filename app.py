@@ -15,12 +15,101 @@ CURRENCIES = {
     "CAD": "カナダドル", "CHF": "スイスフラン", "CNY": "中国元",
     "HKD": "香港ドル", "SGD": "シンガポール・ドル",
     "KRW": "韓国ウォン (100単位)", "THB": "タイ・バーツ",
-    "ZAR": "南アフリカ・ランド",
+    "ZAR": "南アフリカ・ランド", "DKK": "デンマーククローネ",
+    "NOK": "ノルウェークローネ", "SEK": "スウェーデンクローナ",
+    "MYR": "マレーシアリンギット", "SAR": "サウジリヤル",
+    "AED": "UAEディルハム", "INR": "インドルピー",
+    "KWD": "クウェートディナール", "QAR": "カタールリヤル",
+    "IDR": "インドネシアルピア", "MXN": "メキシコペソ",
+    "PHP": "フィリピンペソ", "CZK": "チェココルナ",
+    "RUB": "ロシアルーブル", "HUF": "ハンガリーフォリント",
+    "PLN": "ポーランドズロチ", "TRY": "トルコリラ",
+    "PKR": "パキスタンルピー",
 }
 PER_100 = ["KRW", "IDR"]
 
+# 既知の通貨コードリスト
+KNOWN_CODES = list(CURRENCIES.keys())
 
-def parse_number(text):
+
+def parse_html_for_rates(html: str):
+    """正規表現でHTMLからレートを直接抽出"""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")  # タグを改行に
+    
+    # ページ日付検出
+    page_date = None
+    m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+    if m:
+        page_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    
+    rates = {}
+    
+    # 方式1: tr単位での解析(タグ構造)
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["td", "th"])
+        if len(cells) < 4:
+            continue
+        cell_texts = [c.get_text(" ", strip=True) for c in cells]
+        
+        # 通貨コード位置検出
+        code = None
+        code_pos = None
+        for i, t in enumerate(cell_texts):
+            ts = t.strip()
+            if ts in KNOWN_CODES:
+                code = ts
+                code_pos = i
+                break
+        
+        if not code:
+            continue
+        
+        # 後続セルから数値2つ取得
+        numbers = []
+        for t in cell_texts[code_pos + 1:]:
+            n = _to_float(t)
+            if n is not None and n > 0:
+                numbers.append(n)
+            if len(numbers) >= 2:
+                break
+        
+        if len(numbers) >= 2:
+            tts, ttb = numbers[0], numbers[1]
+            if tts < ttb:
+                tts, ttb = ttb, tts
+            rates[code] = {
+                "TTS": tts,
+                "TTB": ttb,
+                "TTM": round((tts + ttb) / 2, 4)
+            }
+    
+    # 方式2: 失敗時、テキスト全体から正規表現
+    if not rates:
+        # "USD" の後ろの数値2つ(...の改行や空白を許容)
+        for code in KNOWN_CODES:
+            pattern = re.compile(
+                rf"\b{code}\b[\s\S]{{0,200}}?([\d]+\.[\d]+)[\s\S]{{0,50}}?([\d]+\.[\d]+)"
+            )
+            m = pattern.search(text)
+            if m:
+                try:
+                    tts = float(m.group(1))
+                    ttb = float(m.group(2))
+                    if tts < ttb:
+                        tts, ttb = ttb, tts
+                    rates[code] = {
+                        "TTS": tts,
+                        "TTB": ttb,
+                        "TTM": round((tts + ttb) / 2, 4)
+                    }
+                except ValueError:
+                    pass
+    
+    return rates, page_date
+
+
+def _to_float(text):
     if text is None:
         return None
     t = re.sub(r"[,\s\xa0]", "", str(text))
@@ -28,61 +117,6 @@ def parse_number(text):
         return float(t)
     except ValueError:
         return None
-
-
-def parse_html_for_rates(html: str):
-    """通貨コードベースで直接行をマッチ(最も堅牢)"""
-    soup = BeautifulSoup(html, "html.parser")
-    
-    # ページ日付検出
-    page_date = None
-    m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", soup.get_text())
-    if m:
-        page_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    
-    rates = {}
-    
-    # ページ内の全trを取得し、各trを「直接の子セル」のみで解析
-    for tr in soup.find_all("tr"):
-        # 子のtd/thのみ(ネストされたtableの中のtdは除外)
-        cells = tr.find_all(["td", "th"], recursive=False)
-        if len(cells) < 5:
-            continue
-        
-        cell_texts = [c.get_text(strip=True) for c in cells]
-        
-        # 通貨コード(3文字大文字)を探す
-        code = None
-        code_pos = None
-        for i, t in enumerate(cell_texts):
-            if len(t) == 3 and t.isalpha() and t.isupper():
-                code = t
-                code_pos = i
-                break
-        
-        if not code:
-            continue
-        
-        # 通貨コードの後ろにある数値2つ(TTS, TTB)を取得
-        numbers = []
-        for t in cell_texts[code_pos + 1:]:
-            n = parse_number(t)
-            if n is not None and n > 0:
-                numbers.append(n)
-            if len(numbers) >= 2:
-                break
-        
-        if len(numbers) < 2:
-            continue
-        
-        tts, ttb = numbers[0], numbers[1]
-        # 通常 TTS > TTB なので、逆なら入れ替え
-        if tts < ttb:
-            tts, ttb = ttb, tts
-        ttm = round((tts + ttb) / 2, 4)
-        rates[code] = {"TTS": tts, "TTB": ttb, "TTM": ttm}
-    
-    return rates, page_date
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -94,11 +128,13 @@ def fetch_mufg(target_date: date):
     ]
     
     debug_log = []
+    raw_sample = None
     
     for url in urls:
         try:
             res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            res.encoding = res.apparent_encoding or "shift_jis"
+            # MUFGはShift_JIS固定
+            res.encoding = "shift_jis"
             entry = {"url": url, "status": res.status_code, "size": len(res.text)}
             
             if res.status_code == 200 and len(res.text) > 1000:
@@ -106,15 +142,16 @@ def fetch_mufg(target_date: date):
                 entry["page_date"] = page_date
                 entry["currencies_found"] = len(rates)
                 debug_log.append(entry)
+                raw_sample = res.text
                 
                 if rates:
-                    return rates, page_date, url, debug_log
+                    return rates, page_date, url, debug_log, raw_sample
             else:
                 debug_log.append(entry)
         except Exception as e:
             debug_log.append({"url": url, "error": str(e)})
     
-    return None, None, None, debug_log
+    return None, None, None, debug_log, raw_sample
 
 
 # --- UI ---
@@ -122,7 +159,7 @@ col1, col2 = st.columns(2)
 with col1:
     target_date = st.date_input("📅 日付(平日)", value=date.today() - timedelta(days=1))
 with col2:
-    code = st.selectbox("💴 通貨", list(CURRENCIES.keys()),
+    code = st.selectbox("💴 通貨", list(CURRENCIES.keys())[:13],
                         format_func=lambda c: f"{c} - {CURRENCIES[c]}")
 
 amount = st.number_input("💰 金額(外貨)", min_value=0.0, value=100.0, step=1.0)
@@ -131,12 +168,21 @@ rate_key = rate_type.split("(")[0].strip()
 
 if st.button("🔄 レート取得して変換", type="primary"):
     with st.spinner("MUFGからレート取得中..."):
-        rates, page_date, used_url, debug_log = fetch_mufg(target_date)
+        rates, page_date, used_url, debug_log, raw_html = fetch_mufg(target_date)
         
         if not rates:
             st.error("❌ レート取得できませんでした")
             with st.expander("🔧 デバッグ情報"):
                 st.json(debug_log)
+                if raw_html:
+                    # USD周辺だけ抽出
+                    idx = raw_html.find("USD")
+                    if idx >= 0:
+                        st.subheader("USD周辺HTML(500文字)")
+                        st.code(raw_html[max(0,idx-100):idx+500])
+                    else:
+                        st.warning("HTMLに'USD'文字列なし")
+                        st.code(raw_html[:2000])
         else:
             req_str = target_date.strftime("%Y-%m-%d")
             if page_date and page_date != req_str:
